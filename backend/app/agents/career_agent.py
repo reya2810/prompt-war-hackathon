@@ -1,0 +1,30 @@
+from typing import Dict, Any, List
+from sqlalchemy.orm import Session
+from app.agents.base import BaseAgent
+from app.models import JobRole
+
+class CareerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="CareerAgent")
+
+    def get_role_requirements(self, db: Session, user_id: int, role_id: str) -> Dict[str, Any]:
+        job_role = db.query(JobRole).filter(JobRole.id == role_id).first()
+        if not job_role:
+            # Fallback default
+            job_role = db.query(JobRole).first()
+
+        input_desc = f"Analyzing market requirements and skill ontology for role: '{job_role.name}' (id: {role_id})"
+        reqs = job_role.required_skills or []
+        output_desc = f"Loaded {len(reqs)} weighted core competencies. Highest weights: {', '.join([r['skill'] for r in sorted(reqs, key=lambda x: x.get('weight', 1), reverse=True)[:3]])}"
+
+        self.log(db, user_id, "career_requirements_loaded", input_desc, output_desc)
+        return {
+            "role_id": job_role.id,
+            "role_name": job_role.name,
+            "category": job_role.category,
+            "description": job_role.description,
+            "required_skills": reqs
+        }
+
+career_agent = CareerAgent()
+

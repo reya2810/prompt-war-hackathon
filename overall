@@ -1,240 +1,564 @@
-from typing import Dict, Any, Optional
-from datetime import datetime
-from sqlalchemy.orm import Session
-from app.models import User, Roadmap, RoadmapItem, ChatMessage, AgentEvent
-from app.agents.profile_agent import profile_agent
-from app.agents.career_agent import career_agent
-from app.agents.gap_analyst_agent import gap_analyst_agent
-from app.agents.curriculum_agent import curriculum_agent
-from app.agents.assessment_agent import assessment_agent
-from app.agents.mentor_agent import mentor_agent
+# ==============================================================================
+# SkillPath AI - Complete Multi-Agent Personalized Learning Platform
+# Hackathon Submission: Prompt War Hackathon (Overall Consolidated Implementation)
+# Tagline: Know your gaps. Learn what matters. Get job-ready.
+# ==============================================================================
 
-class Orchestrator:
+import os
+import sys
+import json
+import hmac
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any, Set
+from collections import defaultdict, deque
+
+import jwt
+from pydantic import BaseModel, EmailStr
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, Form, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, ForeignKey, DateTime, Boolean, JSON
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
+
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# SECTION 1: CONFIGURATION & DATABASE SETUP
+# ==============================================================================
+
+class Settings(BaseModel):
+    PROJECT_NAME: str = "SkillPath AI"
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./skillpath.db")
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "skillpath-hackathon-supersecret-jwt-key-2026")
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mock")  # mock | gemini | anthropic
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
+settings = Settings()
+
+connect_args = {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(settings.DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ==============================================================================
+# SECTION 2: DATABASE MODELS (12 TABLES)
+# ==============================================================================
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    email = Column(String(150), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    role = Column(String(20), default="learner")  # learner, admin
+    hours_per_week = Column(Integer, default=10)
+    learning_style = Column(String(50), default="project-first")  # video-first, text-first, project-first
+    cohort_id = Column(String(50), default="cohort-2026-alpha")
+    current_role_id = Column(String(100), default="full-stack-developer")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    skills = relationship("UserSkill", back_populates="user", cascade="all, delete-orphan")
+    certifications = relationship("Certification", back_populates="user", cascade="all, delete-orphan")
+    projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
+    roadmaps = relationship("Roadmap", back_populates="user", cascade="all, delete-orphan")
+    attempts = relationship("Attempt", back_populates="user", cascade="all, delete-orphan")
+    agent_events = relationship("AgentEvent", back_populates="user", cascade="all, delete-orphan")
+    chat_messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
+
+class Skill(Base):
+    __tablename__ = "skills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, index=True, nullable=False)
+    category = Column(String(50), nullable=False)
+    description = Column(Text, nullable=True)
+    prerequisites = Column(JSON, default=list)  # Dependency list
+
+class UserSkill(Base):
+    __tablename__ = "user_skills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    skill_name = Column(String(100), index=True, nullable=False)
+    level = Column(Integer, default=50)  # 0 to 100
+    evidence = Column(Text, nullable=True)
+    source = Column(String(50), default="self")  # self, quiz, project, certificate, resume
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="skills")
+
+class Certification(Base):
+    __tablename__ = "certifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    issuer = Column(String(100), nullable=False)
+    issue_date = Column(String(50), nullable=True)
+    credential_url = Column(String(300), nullable=True)
+    skills_covered = Column(JSON, default=list)
+
+    user = relationship("User", back_populates="certifications")
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    repo_url = Column(String(300), nullable=True)
+    live_url = Column(String(300), nullable=True)
+    skills_used = Column(JSON, default=list)
+
+    user = relationship("User", back_populates="projects")
+
+class JobRole(Base):
+    __tablename__ = "job_roles"
+
+    id = Column(String(100), primary_key=True)
+    name = Column(String(150), nullable=False)
+    category = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    required_skills = Column(JSON, nullable=False, default=list)  # [{skill, weight, required_level}]
+
+class Roadmap(Base):
+    __tablename__ = "roadmaps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    target_role_id = Column(String(100), nullable=False)
+    role_name = Column(String(150), nullable=False)
+    total_weeks = Column(Integer, default=12)
+    readiness_score = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="roadmaps")
+    items = relationship("RoadmapItem", back_populates="roadmap", cascade="all, delete-orphan", order_by="RoadmapItem.order")
+
+class RoadmapItem(Base):
+    __tablename__ = "roadmap_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    roadmap_id = Column(Integer, ForeignKey("roadmaps.id"), nullable=False)
+    skill_name = Column(String(100), nullable=False)
+    order = Column(Integer, default=1)
+    week = Column(Integer, default=1)
+    status = Column(String(20), default="locked")  # locked, in_progress, completed
+    reason = Column(String(255), nullable=True)
+    practice_task = Column(JSON, nullable=True)
+    resources = Column(JSON, default=list)
+    completed_at = Column(DateTime, nullable=True)
+
+    roadmap = relationship("Roadmap", back_populates="items")
+
+class Resource(Base):
+    __tablename__ = "resources"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(200), nullable=False)
+    type = Column(String(50), nullable=False)  # course, tutorial, video, docs, exercise
+    url = Column(String(300), nullable=False)
+    skill_name = Column(String(100), index=True, nullable=False)
+    difficulty = Column(String(50), default="beginner")
+    duration = Column(String(50), default="2 hours")
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    skill_name = Column(String(100), index=True, nullable=False)
+    difficulty = Column(String(50), default="intermediate")
+    title = Column(String(200), nullable=False)
+    questions = Column(JSON, nullable=False, default=list)
+
+class Attempt(Base):
+    __tablename__ = "attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    assessment_id = Column(Integer, ForeignKey("assessments.id"), nullable=True)
+    skill_name = Column(String(100), nullable=False)
+    score = Column(Float, nullable=False)
+    weak_subtopics = Column(JSON, default=list)
+    feedback = Column(Text, nullable=True)
+    answers = Column(JSON, default=dict)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="attempts")
+
+class AgentEvent(Base):
+    __tablename__ = "agent_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    event_type = Column(String(100), nullable=False)
+    agent_name = Column(String(100), nullable=False)
+    input_summary = Column(Text, nullable=True)
+    output_summary = Column(Text, nullable=True)
+
+    user = relationship("User", back_populates="agent_events")
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role = Column(String(20), nullable=False)  # user, assistant, system
+    agent_name = Column(String(50), default="MentorAgent")
+    message = Column(Text, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="chat_messages")
+
+# ==============================================================================
+# SECTION 3: SCHEMAS & REQUEST/RESPONSE MODELS
+# ==============================================================================
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: int
+    name: str
+    email: str
+    role: str
+
+class TokenData(BaseModel):
+    user_id: Optional[int] = None
+    email: Optional[str] = None
+    role: Optional[str] = None
+
+class UserRegister(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: Optional[str] = "learner"
+    hours_per_week: Optional[int] = 10
+    learning_style: Optional[str] = "project-first"
+    target_role_id: Optional[str] = "full-stack-developer"
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserSkillItem(BaseModel):
+    skill_name: str
+    level: int
+    evidence: Optional[str] = "Self-assessed"
+    source: Optional[str] = "self"
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    hours_per_week: Optional[int] = None
+    learning_style: Optional[str] = None
+    target_role_id: Optional[str] = None
+    skills: Optional[List[UserSkillItem]] = None
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    role: str
+    hours_per_week: int
+    learning_style: str
+    cohort_id: str
+    current_role_id: str
+    skills: List[UserSkillItem] = []
+
+    class Config:
+        from_attributes = True
+
+class RoleSkillReq(BaseModel):
+    skill: str
+    weight: int
+    required_level: int
+
+class JobRoleResponse(BaseModel):
+    id: str
+    name: str
+    category: str
+    description: Optional[str]
+    required_skills: List[RoleSkillReq]
+
+class SkillEvidence(BaseModel):
+    skill: str
+    level: int
+    required_level: int
+    evidence: str
+    source: str
+    status: str
+
+class GapItem(BaseModel):
+    skill: str
+    weight: int
+    current_level: int
+    required_level: int
+    gap_score: float
+    is_prerequisite: bool
+    prerequisites: List[str] = []
+
+class SkillAnalysisResponse(BaseModel):
+    role_id: str
+    role_name: str
+    readiness_score: float
+    radar_data: List[Dict[str, Any]]
+    strengths: List[str]
+    weaknesses: List[str]
+    matched_skills: List[SkillEvidence]
+    missing_skills: List[GapItem]
+    evidence_breakdown: List[Dict[str, Any]]
+
+class PracticeTaskSchema(BaseModel):
+    title: str
+    description: str
+    starter_code: Optional[str] = None
+    instructions: Optional[List[str]] = []
+
+class ResourceItem(BaseModel):
+    title: str
+    type: str
+    url: str
+    difficulty: str
+    duration: str
+
+class RoadmapItemResponse(BaseModel):
+    id: int
+    skill_name: str
+    order: int
+    week: int
+    status: str
+    reason: Optional[str]
+    practice_task: Optional[PracticeTaskSchema]
+    resources: List[ResourceItem] = []
+    completed_at: Optional[datetime] = None
+
+class RoadmapResponse(BaseModel):
+    id: int
+    user_id: int
+    target_role_id: str
+    role_name: str
+    total_weeks: int
+    readiness_score: float
+    items: List[RoadmapItemResponse] = []
+
+class QuizQuestionSchema(BaseModel):
+    id: int
+    question: str
+    options: List[str]
+    subtopic: str
+
+class AssessmentResponse(BaseModel):
+    id: int
+    skill_name: str
+    title: str
+    difficulty: str
+    questions: List[QuizQuestionSchema]
+
+class QuizSubmitRequest(BaseModel):
+    answers: Dict[str, int]
+
+class QuizResultResponse(BaseModel):
+    skill_name: str
+    score: float
+    passed: bool
+    weak_subtopics: List[str]
+    feedback: str
+    roadmap_updated: bool
+    explanation: str
+
+class ChatRequest(BaseModel):
+    message: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    agent_name: str = "MentorAgent"
+    timestamp: datetime
+
+class AgentEventResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    event_type: str
+    agent_name: str
+    input_summary: Optional[str]
+    output_summary: Optional[str]
+
+class SimulationRequest(BaseModel):
+    skill_to_add: str
+    target_level: int = 80
+    role_id: Optional[str] = None
+
+class SimulationResponse(BaseModel):
+    skill_added: str
+    target_level: int
+    current_readiness: float
+    projected_readiness: float
+    delta: float
+    impact_description: str
+
+class HeatmapCell(BaseModel):
+    skill: str
+    avg_level: float
+    gap_percentage: float
+    at_risk_students: int
+
+class AdminCohortResponse(BaseModel):
+    cohort_id: str
+    total_students: int
+    avg_readiness: float
+    top_skill_gaps: List[Dict[str, Any]]
+    at_risk_learners: List[Dict[str, Any]]
+    role_distribution: Dict[str, int]
+    skill_heatmap: List[HeatmapCell]
+
+# ==============================================================================
+# SECTION 4: SECURITY & AUTHENTICATION
+# ==============================================================================
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return f"{salt.hex()}:{key.hex()}"
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        parts = hashed_password.split(":")
+        if len(parts) != 2:
+            return False
+        salt = bytes.fromhex(parts[0])
+        original_key = bytes.fromhex(parts[1])
+        new_key = hashlib.pbkdf2_hmac('sha256', plain_password.encode('utf-8'), salt, 100000)
+        return hmac.compare_digest(original_key, new_key)
+    except Exception:
+        return False
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        user_id: int = payload.get("user_id")
+        email: str = payload.get("sub")
+        role: str = payload.get("role")
+        if user_id is None or email is None:
+            raise credentials_exception
+        token_data = TokenData(user_id=user_id, email=email, role=role)
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.id == token_data.user_id).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+# ==============================================================================
+# SECTION 5: LLM SERVICE (MOCK FALLBACK + GEMINI)
+# ==============================================================================
+
+class LLMService:
     def __init__(self):
-        self.name = "Orchestrator"
+        self.provider = settings.LLM_PROVIDER.lower()
+        self.gemini_key = settings.GEMINI_API_KEY
 
-    def _log_event(self, db: Session, user_id: int, event_type: str, input_desc: str, output_desc: str):
+    def generate_mentor_reply(self, context: Dict[str, Any], user_message: str) -> str:
+        role_name = context.get("role_name", "your target role")
+        readiness = context.get("readiness_score", 42.0)
+        weak_topics = context.get("weak_subtopics", [])
+        msg_lower = user_message.lower()
+
+        if "why" in msg_lower and ("change" in msg_lower or "remedial" in msg_lower or "plan" in msg_lower or "quiz" in msg_lower):
+            if weak_topics:
+                return f"I updated your roadmap because your recent assessment highlighted opportunities in {', '.join(weak_topics)}. To build strong mastery before moving to advanced topics like React and Node.js, we inserted foundational practice with targeted interactive exercises."
+            return f"Your roadmap adapted based on your latest performance and goal requirements for {role_name}. Every topic is dependency-ordered so you never hit a roadblock when tackling complex frameworks."
+
+        if "javascript" in msg_lower or "js" in msg_lower:
+            return "JavaScript is the core engine of modern full-stack development! Master asynchronous JS (Promises, async/await), DOM manipulation, and closures first—it will make learning React and Node.js ten times smoother."
+
+        if "react" in msg_lower:
+            return "For React, focus on declarative UI state management (useState, useEffect), component composition, and unidirectional data flow. Once your JavaScript fundamentals are solid, React concepts click naturally."
+
+        if "ready" in msg_lower or "score" in msg_lower or "progress" in msg_lower:
+            return f"You are currently at **{readiness:.1f}% job readiness** for {role_name}. Completing your upcoming milestone topics and scoring above 80% on practice quizzes will boost your readiness significantly!"
+
+        return f"Hello! I am your AI Mentor in SkillPath AI. Working towards {role_name}, consistent hands-on coding and verifying concepts with practical mini-projects will accelerate your mastery!"
+
+    def parse_resume_text(self, text: str) -> List[Dict[str, Any]]:
+        found_skills = []
+        text_lower = text.lower()
+        skill_catalog = {
+            "Python": (75, "Demonstrated in resume projects and scripting", ["python", "django", "flask", "pandas"]),
+            "SQL": (70, "Database querying and schema design mentioned", ["sql", "postgres", "mysql", "sqlite"]),
+            "HTML/CSS": (65, "Web layout and responsive UI styling", ["html", "css", "html5", "tailwind"]),
+            "JavaScript": (50, "Frontend scripting and DOM handling", ["javascript", "js", "es6"]),
+            "React": (40, "Component-based web applications", ["react", "redux", "nextjs"]),
+            "Node.js": (40, "Backend REST service development", ["node", "nodejs", "express"]),
+            "Docker": (50, "Containerization and local environments", ["docker", "container"]),
+            "Git": (80, "Version control and GitHub workflows", ["git", "github", "gitlab"]),
+        }
+        for skill, (default_level, evidence_tpl, keywords) in skill_catalog.items():
+            if any(k in text_lower for k in keywords):
+                found_skills.append({
+                    "skill_name": skill,
+                    "level": default_level,
+                    "evidence": evidence_tpl,
+                    "source": "resume"
+                })
+        return found_skills
+
+llm_service = LLMService()
+
+# ==============================================================================
+# SECTION 6: BASE AGENT
+# ==============================================================================
+
+class BaseAgent:
+    def __init__(self, name: str):
+        self.name = name
+
+    def log(self, db: Session, user_id: int, event_type: str, input_summary: str, output_summary: str) -> AgentEvent:
         event = AgentEvent(
             user_id=user_id,
             timestamp=datetime.utcnow(),
             event_type=event_type,
             agent_name=self.name,
-            input_summary=input_desc,
-            output_summary=output_desc
+            input_summary=input_summary,
+            output_summary=output_summary
         )
         db.add(event)
         db.commit()
+        db.refresh(event)
+        return event
 
-    def handle_event(self, event_name: str, db: Session, user: User, payload: Dict[str, Any] = None) -> Dict[str, Any]:
-        payload = payload or {}
-        results = {"event": event_name, "actions_taken": []}
-
-        if event_name == "profile_created":
-            self._log_event(
-                db, user.id, "profile_created",
-                f"New learner profile registered: {user.name} ({user.email}). Goal: {user.current_role_id}",
-                "Triggering multi-agent collaboration cascade: ProfileAgent -> CareerAgent -> GapAnalyst -> CurriculumAgent -> MentorAgent"
-            )
-            # 1. ProfileAgent parses skills
-            skills = profile_agent.process_profile(db, user, resume_text=payload.get("resume_text"))
-            # 2. CareerAgent loads role
-            career_agent.get_role_requirements(db, user.id, user.current_role_id)
-            # 3. GapAnalyst computes gaps & readiness
-            analysis = gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
-            # 4. CurriculumAgent builds roadmap
-            curriculum_agent.build_roadmap(db, user, user.current_role_id, analysis["missing_skills"], analysis["readiness_score"])
-            # 5. Mentor welcomes learner
-            welcome_msg = (
-                f"Welcome {user.name}! I am your AI Mentor. We analyzed your skills against {analysis['role_name']}. "
-                f"Your starting job readiness is {analysis['readiness_score']}%. I've generated a customized dependency-ordered roadmap "
-                f"for you based on {user.hours_per_week} hours/week. Let's conquer your first milestone!"
-            )
-            db.add(ChatMessage(
-                user_id=user.id,
-                role="assistant",
-                agent_name="MentorAgent",
-                message=welcome_msg,
-                timestamp=datetime.utcnow()
-            ))
-            db.commit()
-            results["actions_taken"] = ["profile_analyzed", "role_loaded", "gaps_computed", "roadmap_built", "mentor_welcomed"]
-
-        elif event_name == "goal_changed":
-            new_role_id = payload.get("new_role_id", user.current_role_id)
-            old_role_id = user.current_role_id
-            user.current_role_id = new_role_id
-            db.commit()
-
-            self._log_event(
-                db, user.id, "goal_changed",
-                f"Learner switched target career from '{old_role_id}' to '{new_role_id}'",
-                "Re-routing pipeline: CareerAgent -> GapAnalyst (reusing existing skills) -> CurriculumAgent -> MentorAgent explanation"
-            )
-            # 1. CareerAgent reloads role
-            role_data = career_agent.get_role_requirements(db, user.id, new_role_id)
-            # 2. GapAnalyst recomputes
-            analysis = gap_analyst_agent.analyze_gaps(db, user, new_role_id)
-            # 3. CurriculumAgent rebuilds roadmap
-            roadmap = curriculum_agent.build_roadmap(db, user, new_role_id, analysis["missing_skills"], analysis["readiness_score"])
-            # 4. Mentor explains adaptation
-            matched_names = [m["skill"] for m in analysis["matched_skills"]]
-            reuse_note = f"Your existing strengths in {', '.join(matched_names[:3])} were reused, saving weeks of effort!" if matched_names else ""
-            explanation = (
-                f"Goal change detected: Now targeting **{role_data['role_name']}**! "
-                f"Your current readiness for this role is **{analysis['readiness_score']}%**. {reuse_note} "
-                f"The Curriculum Agent has restructured your timeline to focus on {', '.join([g['skill'] for g in analysis['missing_skills'][:2]])}."
-            )
-            db.add(ChatMessage(
-                user_id=user.id,
-                role="assistant",
-                agent_name="MentorAgent",
-                message=explanation,
-                timestamp=datetime.utcnow()
-            ))
-            db.commit()
-            results["actions_taken"] = ["career_reloaded", "gaps_recomputed", "roadmap_rebuilt", "mentor_explained"]
-            results["analysis"] = analysis
-
-        elif event_name == "assessment_submitted":
-            skill_name = payload.get("skill_name")
-            answers = payload.get("answers", {})
-            grade_res = assessment_agent.grade_assessment(db, user, skill_name, answers)
-            score = grade_res["score"]
-            weak_subs = grade_res["weak_subtopics"]
-
-            if score < 60.0:
-                self._log_event(
-                    db, user.id, "adaptive_rule_triggered",
-                    f"Score below 60% ({score}%) on '{skill_name}'. Knowledge gaps in: {weak_subs}",
-                    "CurriculumAgent: inserting remedial review module; MentorAgent: issuing study tips & empathetic encouragement."
-                )
-                curriculum_agent.adapt_for_low_score(db, user, skill_name, score, weak_subs)
-                
-                # Mentor encouragement
-                msg = (
-                    f"Don't worry about scoring {score:.0f}% on {skill_name}! Mastery is an iterative process. "
-                    f"I've updated your roadmap to include a focused review on {', '.join(weak_subs) if weak_subs else 'fundamentals'}. "
-                    f"Take a look at the newly added remedial drills before retrying the milestone."
-                )
-                db.add(ChatMessage(
-                    user_id=user.id,
-                    role="assistant",
-                    agent_name="MentorAgent",
-                    message=msg,
-                    timestamp=datetime.utcnow()
-                ))
-                db.commit()
-                results["actions_taken"] = ["graded", "remedial_inserted", "mentor_encouraged"]
-                results["roadmap_updated"] = True
-                results["explanation"] = f"Roadmap adapted: Inserted remedial review module '{skill_name} Fundamentals & Review' to reinforce weak areas."
-
-            elif 60.0 <= score <= 80.0:
-                self._log_event(
-                    db, user.id, "adaptive_rule_triggered",
-                    f"Score between 60% and 80% ({score}%) on '{skill_name}'. Passing, but needs reinforcement.",
-                    "CurriculumAgent: keeping plan schedule; adding reinforcement mini-challenge."
-                )
-                results["actions_taken"] = ["graded", "reinforcement_attached"]
-                results["roadmap_updated"] = False
-                results["explanation"] = f"Solid work ({score}%). Core plan maintained with reinforcement exercises added."
-
-            else: # score > 80.0
-                self._log_event(
-                    db, user.id, "adaptive_rule_triggered",
-                    f"Score above 80% ({score}%) on '{skill_name}'. Skill demonstrated at advanced level.",
-                    "CurriculumAgent: marking milestone achieved, unlocking next topic & capstone project."
-                )
-                # Mark topic as completed
-                roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
-                if roadmap:
-                    item = db.query(RoadmapItem).filter(
-                        RoadmapItem.roadmap_id == roadmap.id,
-                        RoadmapItem.skill_name == skill_name
-                    ).first()
-                    if item:
-                        item.status = "completed"
-                        item.completed_at = datetime.utcnow()
-                        # Unlock next
-                        next_item = db.query(RoadmapItem).filter(
-                            RoadmapItem.roadmap_id == roadmap.id,
-                            RoadmapItem.order > item.order
-                        ).order_by(RoadmapItem.order.asc()).first()
-                        if next_item and next_item.status == "locked":
-                            next_item.status = "in_progress"
-                        db.commit()
-
-                results["actions_taken"] = ["graded", "milestone_unlocked"]
-                results["roadmap_updated"] = True
-                results["explanation"] = f"Exceptional work ({score}%)! Milestone unlocked and readiness boosted."
-
-            # Recompute readiness
-            analysis = gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
-            roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
-            if roadmap:
-                roadmap.readiness_score = analysis["readiness_score"]
-                db.commit()
-
-            results["grade"] = grade_res
-
-        elif event_name == "topic_completed":
-            item_id = payload.get("item_id")
-            item = db.query(RoadmapItem).filter(RoadmapItem.id == item_id).first()
-            if item:
-                item.status = "completed"
-                item.completed_at = datetime.utcnow()
-                
-                # Unlock next item in sequence
-                next_item = db.query(RoadmapItem).filter(
-                    RoadmapItem.roadmap_id == item.roadmap_id,
-                    RoadmapItem.order > item.order
-                ).order_by(RoadmapItem.order.asc()).first()
-                if next_item and next_item.status == "locked":
-                    next_item.status = "in_progress"
-
-                db.commit()
-
-                # Recompute readiness
-                analysis = gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
-                roadmap = db.query(Roadmap).filter(Roadmap.id == item.roadmap_id).first()
-                if roadmap:
-                    roadmap.readiness_score = analysis["readiness_score"]
-                    db.commit()
-
-                self._log_event(
-                    db, user.id, "topic_completed",
-                    f"Learner completed topic: '{item.skill_name}'",
-                    f"Updated progress. Next topic '{next_item.skill_name if next_item else 'Capstone'}' unlocked. Readiness: {analysis['readiness_score']}%."
-                )
-                results["actions_taken"] = ["topic_marked_completed", "next_topic_unlocked", "readiness_updated"]
-
-        elif event_name == "inactivity_detected":
-            days = payload.get("days", 5)
-            self._log_event(
-                db, user.id, "inactivity_detected",
-                f"No learning events detected for {days} days.",
-                "Orchestrator: requesting MentorAgent friendly nudge and CurriculumAgent workload adjustment."
-            )
-            nudge = (
-                f"Hey {user.name}, we missed you over the past few days! Don't let your momentum slip. "
-                "I've adjusted your weekly study milestones to be more bite-sized so you can jump back in smoothly."
-            )
-            db.add(ChatMessage(
-                user_id=user.id,
-                role="assistant",
-                agent_name="MentorAgent",
-                message=nudge,
-                timestamp=datetime.utcnow()
-            ))
-            db.commit()
-            results["actions_taken"] = ["nudge_sent", "workload_lightened"]
-
-        return results
-
-orchestrator = Orchestrator()from typing import List, Dict, Any
-from sqlalchemy.orm import Session
-from app.agents.base import BaseAgent
-from app.models import User, UserSkill
-from app.services.llm import llm_service
+# ==============================================================================
+# SECTION 7: AUTONOMOUS COLLABORATING AGENTS
+# ==============================================================================
 
 class ProfileAgent(BaseAgent):
     def __init__(self):
@@ -242,8 +566,6 @@ class ProfileAgent(BaseAgent):
 
     def process_profile(self, db: Session, user: User, resume_text: str = None) -> List[Dict[str, Any]]:
         input_desc = f"Parsing profile for user {user.name} ({user.email}). Resume provided: {bool(resume_text)}"
-        
-        extracted_skills = []
         if resume_text:
             extracted_skills = llm_service.parse_resume_text(resume_text)
             for item in extracted_skills:
@@ -256,530 +578,581 @@ class ProfileAgent(BaseAgent):
                     existing.evidence = item["evidence"]
                     existing.source = "resume"
                 else:
-                    new_skill = UserSkill(
+                    db.add(UserSkill(
                         user_id=user.id,
                         skill_name=item["skill_name"],
                         level=item["level"],
                         evidence=item["evidence"],
                         source="resume"
-                    )
-                    db.add(new_skill)
+                    ))
             db.commit()
 
         current_skills = db.query(UserSkill).filter(UserSkill.user_id == user.id).all()
         output_desc = f"Identified {len(current_skills)} structured skills with proficiency levels & evidence."
-        
         self.log(db, user.id, "profile_processed", input_desc, output_desc)
         return [{"skill_name": s.skill_name, "level": s.level, "evidence": s.evidence} for s in current_skills]
 
 profile_agent = ProfileAgent()
 
-import os
-from pydantic import BaseModel
+class CareerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="CareerAgent")
 
-class Settings(BaseModel):
-    PROJECT_NAME: str = "SkillPath AI"
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./skillpath.db")
-    JWT_SECRET: str = os.getenv("JWT_SECRET", "skillpath-hackathon-supersecret-jwt-key-2026")
-    JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7 # 7 days
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mock") # mock | gemini | anthropic
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    def get_role_requirements(self, db: Session, user_id: int, role_id: str) -> Dict[str, Any]:
+        job_role = db.query(JobRole).filter(JobRole.id == role_id).first() or db.query(JobRole).first()
+        reqs = job_role.required_skills or []
+        input_desc = f"Analyzing requirements for role: '{job_role.name}' ({role_id})"
+        output_desc = f"Loaded {len(reqs)} competencies. Top weights: {', '.join([r['skill'] for r in sorted(reqs, key=lambda x: x.get('weight', 1), reverse=True)[:3]])}"
+        self.log(db, user_id, "career_requirements_loaded", input_desc, output_desc)
+        return {
+            "role_id": job_role.id,
+            "role_name": job_role.name,
+            "category": job_role.category,
+            "description": job_role.description,
+            "required_skills": reqs
+        }
 
-settings = Settings()
+career_agent = CareerAgent()
 
-import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from app.config import settings
-from app.seed.seed_data import init_db
-from app.routers import (
-    auth, profile, roles, analysis, roadmap,
-    assessments, progress, mentor, agents_activity, admin, simulate
-)
+class GapAnalystAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="GapAnalyst")
 
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    description="Multi-Agent Personalized Learning Platform API - Know your gaps. Learn what matters. Get job-ready.",
-    version="1.0.0"
-)
+    def analyze_gaps(self, db: Session, user: User, role_id: str) -> Dict[str, Any]:
+        job_role = db.query(JobRole).filter(JobRole.id == role_id).first() or db.query(JobRole).first()
+        user_skills_map = {s.skill_name.lower(): s for s in db.query(UserSkill).filter(UserSkill.user_id == user.id).all()}
+        all_skills = {s.name.lower(): s for s in db.query(Skill).all()}
+        required_skills = job_role.required_skills or []
 
-# CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        total_weight = 0.0
+        weighted_user_score = 0.0
+        radar_data, strengths, weaknesses, matched_skills, missing_skills, evidence_breakdown = [], [], [], [], [], []
+        needed_skill_names = {r["skill"].lower() for r in required_skills}
 
-# Startup event to ensure database tables & seed data are initialized
+        for req in required_skills:
+            s_name = req["skill"]
+            s_key = s_name.lower()
+            weight = float(req.get("weight", 3))
+            req_level = float(req.get("required_level", 80))
+            total_weight += weight
+
+            user_skill = user_skills_map.get(s_key)
+            current_level = float(user_skill.level) if user_skill else 0.0
+            evidence = user_skill.evidence if user_skill else "No direct evidence provided"
+            source = user_skill.source if user_skill else "none"
+
+            ratio = min(current_level / req_level, 1.0) if req_level > 0 else 1.0
+            weighted_user_score += weight * ratio
+
+            radar_data.append({"skill": s_name, "current": int(current_level), "required": int(req_level), "fullMark": 100})
+
+            is_prereq = False
+            prereqs_of_this = all_skills[s_key].prerequisites or [] if s_key in all_skills else []
+            for other_k in needed_skill_names:
+                if other_k in all_skills and s_key in [p.lower() for p in (all_skills[other_k].prerequisites or [])]:
+                    is_prereq = True
+                    break
+
+            level_diff = max(0.0, req_level - current_level)
+            boost = 1.35 if is_prereq else 1.0
+            gap_score = weight * level_diff * boost
+
+            if current_level >= 70:
+                strengths.append(s_name)
+            elif current_level < 60:
+                weaknesses.append(s_name)
+
+            if current_level >= req_level * 0.75:
+                matched_skills.append({"skill": s_name, "level": int(current_level), "required_level": int(req_level), "evidence": evidence, "source": source, "status": "matched"})
+            else:
+                missing_skills.append({"skill": s_name, "weight": int(weight), "current_level": int(current_level), "required_level": int(req_level), "gap_score": round(gap_score, 2), "is_prerequisite": is_prereq, "prerequisites": prereqs_of_this})
+
+            evidence_breakdown.append({"skill": s_name, "current_level": int(current_level), "required_level": int(req_level), "evidence": evidence, "source": source})
+
+        readiness = (weighted_user_score / total_weight * 100.0) if total_weight > 0 else 0.0
+        readiness = round(min(100.0, max(0.0, readiness)), 1)
+        missing_skills.sort(key=lambda x: x["gap_score"], reverse=True)
+
+        input_desc = f"Comparing {len(user_skills_map)} skills vs {len(required_skills)} reqs for {job_role.name}."
+        output_desc = f"Readiness: {readiness}%. Gaps: {len(missing_skills)}. Priority: {', '.join([m['skill'] for m in missing_skills[:3]])}."
+        self.log(db, user.id, "gap_analysis_computed", input_desc, output_desc)
+
+        return {
+            "role_id": job_role.id,
+            "role_name": job_role.name,
+            "readiness_score": readiness,
+            "radar_data": radar_data,
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "matched_skills": matched_skills,
+            "missing_skills": missing_skills,
+            "evidence_breakdown": evidence_breakdown
+        }
+
+gap_analyst_agent = GapAnalystAgent()
+
+class CurriculumAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="CurriculumAgent")
+
+    def _topological_sort(self, skills_to_order: List[str], skill_prereqs_map: Dict[str, List[str]]) -> List[str]:
+        in_degree = {s: 0 for s in skills_to_order}
+        graph = defaultdict(list)
+        skills_set = set(skills_to_order)
+
+        for s in skills_to_order:
+            for p in skill_prereqs_map.get(s, []):
+                if p in skills_set:
+                    graph[p].append(s)
+                    in_degree[s] += 1
+
+        queue = deque([s for s in skills_to_order if in_degree[s] == 0])
+        ordered = []
+        while queue:
+            node = queue.popleft()
+            ordered.append(node)
+            for neighbor in graph[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        for s in skills_to_order:
+            if s not in ordered:
+                ordered.append(s)
+        return ordered
+
+    def build_roadmap(self, db: Session, user: User, role_id: str, missing_skills: List[Dict[str, Any]], readiness_score: float) -> Roadmap:
+        all_skills = {s.name: s for s in db.query(Skill).all()}
+        skill_prereqs_map = {name: s.prerequisites or [] for name, s in all_skills.items()}
+        skill_names = [m["skill"] for m in missing_skills] or ["Advanced System Design", "Production CI/CD Pipelines", "Capstone Project"]
+        ordered_skills = self._topological_sort(skill_names, skill_prereqs_map)
+
+        roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
+        job_role = db.query(JobRole).filter(JobRole.id == role_id).first()
+        role_name = job_role.name if job_role else "Target Role"
+
+        if not roadmap:
+            roadmap = Roadmap(user_id=user.id, target_role_id=role_id, role_name=role_name, total_weeks=max(len(ordered_skills), 4), readiness_score=readiness_score)
+            db.add(roadmap)
+            db.commit()
+            db.refresh(roadmap)
+        else:
+            roadmap.target_role_id = role_id
+            roadmap.role_name = role_name
+            roadmap.readiness_score = readiness_score
+            db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == roadmap.id).delete()
+            db.commit()
+
+        pace_mult = max(1, round(10 / max(user.hours_per_week, 4)))
+        items = []
+        for idx, skill_name in enumerate(ordered_skills):
+            week_num = (idx * pace_mult) + 1
+            prereqs = skill_prereqs_map.get(skill_name, [])
+            reason = f"Prerequisite for {', '.join(prereqs[:2])}" if prereqs else "Core requirement for role"
+            res_list = [
+                {"title": f"Mastering {skill_name}", "type": "docs", "url": f"https://developer.mozilla.org", "difficulty": "intermediate", "duration": "2 hours"},
+                {"title": f"{skill_name} Video Walkthrough", "type": "video", "url": f"https://youtube.com", "difficulty": "beginner", "duration": "1.5 hours"},
+                {"title": f"{skill_name} Interactive Drills", "type": "exercise", "url": f"https://exercism.org", "difficulty": "beginner", "duration": "3 hours"}
+            ]
+            task = {
+                "title": f"Milestone Challenge: {skill_name}",
+                "description": f"Build a functional micro-service verifying {skill_name} core syntax, edge cases, and asynchronous handling.",
+                "starter_code": f"// Implement {skill_name} challenge\\nfunction init() {{ console.log('{skill_name} ready'); }}\\ninit();"
+            }
+            item = RoadmapItem(roadmap_id=roadmap.id, skill_name=skill_name, order=idx+1, week=week_num, status="in_progress" if idx == 0 else "locked", reason=reason, practice_task=task, resources=res_list)
+            db.add(item)
+            items.append(item)
+
+        roadmap.total_weeks = items[-1].week if items else 12
+        db.commit()
+
+        input_desc = f"Building dependency roadmap for {len(ordered_skills)} skills with {user.hours_per_week}h/wk."
+        output_desc = f"Generated {len(items)}-week topological path. Initial topic: '{ordered_skills[0] if ordered_skills else 'N/A'}'."
+        self.log(db, user.id, "roadmap_generated", input_desc, output_desc)
+        return roadmap
+
+    def adapt_for_low_score(self, db: Session, user: User, skill_name: str, score: float, weak_subtopics: List[str]):
+        roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
+        if not roadmap:
+            return
+        remedial_title = f"{skill_name} Fundamentals & Review"
+        if not db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == roadmap.id, RoadmapItem.skill_name == remedial_title).first():
+            target_item = db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == roadmap.id, RoadmapItem.skill_name == skill_name).first()
+            insert_order = target_item.order if target_item else 1
+            insert_week = target_item.week if target_item else 1
+
+            for s in db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == roadmap.id, RoadmapItem.order >= insert_order).all():
+                s.order += 1
+                s.week += 1
+
+            weak_text = f" ({', '.join(weak_subtopics)})" if weak_subtopics else ""
+            remedial_item = RoadmapItem(
+                roadmap_id=roadmap.id,
+                skill_name=remedial_title,
+                order=insert_order,
+                week=insert_week,
+                status="in_progress",
+                reason=f"Inserted remedial topic: Low quiz score ({score:.0f}%){weak_text}",
+                practice_task={"title": f"Remedial Drills: {skill_name}", "description": f"Remediation on {', '.join(weak_subtopics) if weak_subtopics else 'fundamentals'}."},
+                resources=[{"title": f"{skill_name} Review Tutorial", "type": "video", "url": "https://youtube.com", "difficulty": "beginner", "duration": "45m"}]
+            )
+            db.add(remedial_item)
+            roadmap.total_weeks += 1
+            db.commit()
+            self.log(db, user.id, "curriculum_remedial_inserted", f"Score {score}% on {skill_name}. Weak: {weak_subtopics}", f"Inserted '{remedial_title}' at week {insert_week}.")
+
+curriculum_agent = CurriculumAgent()
+
+class AssessmentAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="AssessmentAgent")
+
+    def grade_assessment(self, db: Session, user: User, skill_name: str, answers: Dict[str, int]) -> Dict[str, Any]:
+        assessment = db.query(Assessment).filter(Assessment.skill_name.ilike(skill_name)).first()
+        questions = assessment.questions if assessment else [
+            {"id": 1, "question": f"What is the best practice for architecture in {skill_name}?", "options": ["Tight coupling", "Modular separation of concerns", "Ignore errors", "Hardcoding"], "correct_answer": 1, "subtopic": "Architecture"},
+            {"id": 2, "question": f"How are async operations handled in {skill_name}?", "options": ["Blocking thread", "Promises / async-await", "Infinite busy loop", "Process kill"], "correct_answer": 1, "subtopic": "Concurrency"}
+        ]
+
+        total = len(questions)
+        correct = 0
+        weak_set = set()
+        for q in questions:
+            user_ans = answers.get(str(q["id"]))
+            if user_ans is not None and int(user_ans) == int(q.get("correct_answer", 0)):
+                correct += 1
+            else:
+                weak_set.add(q.get("subtopic", "Core"))
+
+        score = round((correct / total * 100.0) if total > 0 else 0.0, 1)
+        weak_list = list(weak_set)
+        passed = score >= 60.0
+
+        feedback = f"Outstanding! ({score}%)" if score >= 80 else (f"Good effort ({score}%). Reinforce {', '.join(weak_list)}." if score >= 60 else f"Needs remediation ({score}%). Gaps in {', '.join(weak_list)}.")
+
+        db.add(Attempt(user_id=user.id, assessment_id=assessment.id if assessment else None, skill_name=skill_name, score=score, weak_subtopics=weak_list, feedback=feedback, answers=answers))
+        
+        user_skill = db.query(UserSkill).filter(UserSkill.user_id == user.id, UserSkill.skill_name == skill_name).first()
+        if user_skill:
+            user_skill.level = int(score)
+            user_skill.evidence = f"Scored {score:.0f}% on assessment. Weak subtopics: {', '.join(weak_list) if weak_list else 'none'}."
+            user_skill.source = "quiz"
+        else:
+            db.add(UserSkill(user_id=user.id, skill_name=skill_name, level=int(score), evidence=f"Scored {score:.0f}% on quiz.", source="quiz"))
+        db.commit()
+
+        self.log(db, user.id, "assessment_graded", f"Grading '{skill_name}': {len(answers)} submitted.", f"Score: {score}% ({'PASSED' if passed else 'FAILED'}). Weak: {weak_list}.")
+        return {"skill_name": skill_name, "score": score, "passed": passed, "weak_subtopics": weak_list, "feedback": feedback}
+
+assessment_agent = AssessmentAgent()
+
+class MentorAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(name="MentorAgent")
+
+    def chat(self, db: Session, user: User, user_message: str) -> str:
+        roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
+        recent_attempt = db.query(Attempt).filter(Attempt.user_id == user.id).order_by(Attempt.timestamp.desc()).first()
+        context = {
+            "role_name": roadmap.role_name if roadmap else user.current_role_id,
+            "readiness_score": roadmap.readiness_score if roadmap else 40.0,
+            "recent_event": f"Attempted {recent_attempt.skill_name} with score {recent_attempt.score:.0f}%" if recent_attempt else "Profile active",
+            "weak_subtopics": recent_attempt.weak_subtopics if recent_attempt else []
+        }
+        db.add(ChatMessage(user_id=user.id, role="user", agent_name="User", message=user_message, timestamp=datetime.utcnow()))
+        reply = llm_service.generate_mentor_reply(context, user_message)
+        db.add(ChatMessage(user_id=user.id, role="assistant", agent_name="MentorAgent", message=reply, timestamp=datetime.utcnow()))
+        db.commit()
+        self.log(db, user.id, "mentor_guidance_provided", f"User asked: '{user_message}'", f"Mentor replied: '{reply[:100]}...'")
+        return reply
+
+mentor_agent = MentorAgent()
+
+# ==============================================================================
+# SECTION 8: EVENT-DRIVEN ORCHESTRATOR
+# ==============================================================================
+
+class Orchestrator:
+    def __init__(self):
+        self.name = "Orchestrator"
+
+    def _log_event(self, db: Session, user_id: int, event_type: str, input_desc: str, output_desc: str):
+        event = AgentEvent(user_id=user_id, timestamp=datetime.utcnow(), event_type=event_type, agent_name=self.name, input_summary=input_desc, output_summary=output_desc)
+        db.add(event)
+        db.commit()
+
+    def handle_event(self, event_name: str, db: Session, user: User, payload: Dict[str, Any] = None) -> Dict[str, Any]:
+        payload = payload or {}
+        results = {"event": event_name, "actions_taken": []}
+
+        if event_name == "profile_created":
+            self._log_event(db, user.id, "profile_created", f"New learner registered: {user.name} ({user.email}). Goal: {user.current_role_id}", "Triggering: ProfileAgent -> CareerAgent -> GapAnalyst -> CurriculumAgent -> MentorAgent")
+            profile_agent.process_profile(db, user, resume_text=payload.get("resume_text"))
+            career_agent.get_role_requirements(db, user.id, user.current_role_id)
+            analysis = gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
+            curriculum_agent.build_roadmap(db, user, user.current_role_id, analysis["missing_skills"], analysis["readiness_score"])
+            welcome_msg = f"Welcome {user.name}! We analyzed your competencies against {analysis['role_name']}. Starting readiness: {analysis['readiness_score']}%. Your dependency-ordered roadmap is active!"
+            db.add(ChatMessage(user_id=user.id, role="assistant", agent_name="MentorAgent", message=welcome_msg, timestamp=datetime.utcnow()))
+            db.commit()
+            results["actions_taken"] = ["profile_analyzed", "role_loaded", "gaps_computed", "roadmap_built", "mentor_welcomed"]
+
+        elif event_name == "goal_changed":
+            new_role_id = payload.get("new_role_id", user.current_role_id)
+            user.current_role_id = new_role_id
+            db.commit()
+            self._log_event(db, user.id, "goal_changed", f"Goal switched to '{new_role_id}'", "Re-routing: CareerAgent -> GapAnalyst (reusing skills) -> CurriculumAgent -> MentorAgent")
+            role_data = career_agent.get_role_requirements(db, user.id, new_role_id)
+            analysis = gap_analyst_agent.analyze_gaps(db, user, new_role_id)
+            curriculum_agent.build_roadmap(db, user, new_role_id, analysis["missing_skills"], analysis["readiness_score"])
+            matched_names = [m["skill"] for m in analysis["matched_skills"]]
+            reuse_note = f"Your existing strengths in {', '.join(matched_names[:3])} were reused!" if matched_names else ""
+            msg = f"Goal changed to **{role_data['role_name']}**! Current readiness: **{analysis['readiness_score']}%**. {reuse_note}"
+            db.add(ChatMessage(user_id=user.id, role="assistant", agent_name="MentorAgent", message=msg, timestamp=datetime.utcnow()))
+            db.commit()
+            results["actions_taken"] = ["career_reloaded", "gaps_recomputed", "roadmap_rebuilt", "mentor_explained"]
+            results["analysis"] = analysis
+
+        elif event_name == "assessment_submitted":
+            skill_name = payload.get("skill_name")
+            grade_res = assessment_agent.grade_assessment(db, user, skill_name, payload.get("answers", {}))
+            score = grade_res["score"]
+            weak_subs = grade_res["weak_subtopics"]
+
+            if score < 60.0:
+                self._log_event(db, user.id, "adaptive_rule_triggered", f"Score < 60% ({score}%) on '{skill_name}'. Weak: {weak_subs}", "CurriculumAgent: inserting remedial review module; MentorAgent: advice & study tip.")
+                curriculum_agent.adapt_for_low_score(db, user, skill_name, score, weak_subs)
+                msg = f"Iterative mastery is normal! Scored {score:.0f}% on {skill_name}. We inserted a remedial review on {', '.join(weak_subs) if weak_subs else 'fundamentals'} before you advance."
+                db.add(ChatMessage(user_id=user.id, role="assistant", agent_name="MentorAgent", message=msg, timestamp=datetime.utcnow()))
+                db.commit()
+                results["actions_taken"] = ["graded", "remedial_inserted", "mentor_encouraged"]
+                results["roadmap_updated"] = True
+                results["explanation"] = f"Roadmap adapted: Inserted remedial review module '{skill_name} Fundamentals & Review' to reinforce weak areas."
+            elif score <= 80.0:
+                self._log_event(db, user.id, "adaptive_rule_triggered", f"Score {score}% on '{skill_name}'. Passing, but needs reinforcement.", "CurriculumAgent: keeping plan schedule; adding reinforcement mini-challenge.")
+                results["actions_taken"] = ["graded", "reinforcement_attached"]
+                results["roadmap_updated"] = False
+                results["explanation"] = f"Solid work ({score}%). Core schedule maintained."
+            else:
+                self._log_event(db, user.id, "adaptive_rule_triggered", f"Score > 80% ({score}%) on '{skill_name}'. Advanced mastery.", "CurriculumAgent: marking milestone achieved, unlocking next topic & capstone project.")
+                roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
+                if roadmap:
+                    item = db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == roadmap.id, RoadmapItem.skill_name == skill_name).first()
+                    if item:
+                        item.status = "completed"
+                        next_item = db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == roadmap.id, RoadmapItem.order > item.order).order_by(RoadmapItem.order.asc()).first()
+                        if next_item and next_item.status == "locked":
+                            next_item.status = "in_progress"
+                        db.commit()
+                results["actions_taken"] = ["graded", "milestone_unlocked"]
+                results["roadmap_updated"] = True
+                results["explanation"] = f"Exceptional work ({score}%)! Milestone unlocked."
+
+            analysis = gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
+            roadmap = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
+            if roadmap:
+                roadmap.readiness_score = analysis["readiness_score"]
+                db.commit()
+            results["grade"] = grade_res
+
+        elif event_name == "topic_completed":
+            item_id = payload.get("item_id")
+            item = db.query(RoadmapItem).filter(RoadmapItem.id == item_id).first()
+            if item:
+                item.status = "completed"
+                next_item = db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == item.roadmap_id, RoadmapItem.order > item.order).order_by(RoadmapItem.order.asc()).first()
+                if next_item and next_item.status == "locked":
+                    next_item.status = "in_progress"
+                db.commit()
+                analysis = gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
+                roadmap = db.query(Roadmap).filter(Roadmap.id == item.roadmap_id).first()
+                if roadmap:
+                    roadmap.readiness_score = analysis["readiness_score"]
+                    db.commit()
+                self._log_event(db, user.id, "topic_completed", f"Learner finished: '{item.skill_name}'", f"Unlocked next topic. Readiness: {analysis['readiness_score']}%")
+                results["actions_taken"] = ["topic_completed", "next_unlocked"]
+
+        return results
+
+orchestrator = Orchestrator()
+
+# ==============================================================================
+# SECTION 9: SEED DATA INITIALIZER
+# ==============================================================================
+
+SKILLS_SEED = [
+    {"name": "HTML/CSS", "category": "Frontend", "description": "Semantic markup, Flexbox & Grid", "prerequisites": []},
+    {"name": "JavaScript", "category": "Frontend", "description": "Modern ES6+, DOM, async/await", "prerequisites": ["HTML/CSS"]},
+    {"name": "React", "category": "Frontend", "description": "Component architecture, hooks & state", "prerequisites": ["JavaScript", "HTML/CSS"]},
+    {"name": "Node.js", "category": "Backend", "description": "V8 runtime, event loop, Express", "prerequisites": ["JavaScript"]},
+    {"name": "Python", "category": "Backend", "description": "Core scripting, OOP, libraries", "prerequisites": []},
+    {"name": "SQL", "category": "Database", "description": "Relational schemas, joins, indexing", "prerequisites": []},
+    {"name": "REST APIs", "category": "Backend", "description": "HTTP endpoints, status codes, auth", "prerequisites": ["JavaScript", "Python"]},
+    {"name": "Git", "category": "DevOps", "description": "Version control, branching, PRs", "prerequisites": []},
+    {"name": "Docker", "category": "DevOps", "description": "Container virtualization & Dockerfiles", "prerequisites": ["Git"]},
+    {"name": "Machine Learning", "category": "Data Science", "description": "Supervised & unsupervised models", "prerequisites": ["Python", "SQL"]},
+]
+
+JOB_ROLES_SEED = [
+    {
+        "id": "full-stack-developer",
+        "name": "Full Stack Developer",
+        "category": "Software Engineering",
+        "description": "Builds modern end-to-end web apps with interactive UIs and robust backend APIs.",
+        "required_skills": [
+            {"skill": "JavaScript", "weight": 5, "required_level": 80},
+            {"skill": "React", "weight": 5, "required_level": 80},
+            {"skill": "Node.js", "weight": 5, "required_level": 80},
+            {"skill": "HTML/CSS", "weight": 3, "required_level": 80},
+            {"skill": "SQL", "weight": 4, "required_level": 75},
+            {"skill": "REST APIs", "weight": 4, "required_level": 80},
+            {"skill": "Git", "weight": 3, "required_level": 70},
+            {"skill": "Docker", "weight": 3, "required_level": 65}
+        ]
+    },
+    {
+        "id": "data-scientist",
+        "name": "Data Scientist",
+        "category": "AI & Analytics",
+        "description": "Discovers predictive insights and designs machine learning pipelines.",
+        "required_skills": [
+            {"skill": "Python", "weight": 5, "required_level": 85},
+            {"skill": "SQL", "weight": 4, "required_level": 80},
+            {"skill": "Machine Learning", "weight": 5, "required_level": 80},
+            {"skill": "Git", "weight": 3, "required_level": 70}
+        ]
+    }
+]
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        if db.query(Skill).count() == 0:
+            for s in SKILLS_SEED:
+                db.add(Skill(name=s["name"], category=s["category"], description=s["description"], prerequisites=s["prerequisites"]))
+            db.commit()
+
+        if db.query(JobRole).count() == 0:
+            for r in JOB_ROLES_SEED:
+                db.add(JobRole(id=r["id"], name=r["name"], category=r["category"], description=r["description"], required_skills=r["required_skills"]))
+            db.commit()
+
+        # Seed Demo Student (Alex Rivera)
+        student = db.query(User).filter(User.email == "student@skillpath.ai").first()
+        if not student:
+            student = User(
+                name="Alex Rivera", email="student@skillpath.ai", hashed_password=hash_password("password123"),
+                role="learner", hours_per_week=10, learning_style="project-first",
+                cohort_id="cohort-2026-alpha", current_role_id="full-stack-developer"
+            )
+            db.add(student)
+            db.commit()
+            db.refresh(student)
+            db.add(UserSkill(user_id=student.id, skill_name="Python", level=75, evidence="Data scraping scripts", source="project"))
+            db.add(UserSkill(user_id=student.id, skill_name="SQL", level=70, evidence="Database certificate", source="certificate"))
+            db.add(UserSkill(user_id=student.id, skill_name="HTML/CSS", level=60, evidence="Layout components", source="self"))
+            db.commit()
+            orchestrator.handle_event("profile_created", db, student)
+
+        # Seed Demo Admin
+        if not db.query(User).filter(User.email == "admin@skillpath.ai").first():
+            db.add(User(
+                name="Dr. Evelyn Reed", email="admin@skillpath.ai", hashed_password=hash_password("admin123"),
+                role="admin", hours_per_week=20, cohort_id="cohort-2026-alpha", current_role_id="full-stack-developer"
+            ))
+            db.commit()
+    finally:
+        db.close()
+
+# ==============================================================================
+# SECTION 10: FASTAPI APPLICATION & REST API ENDPOINTS
+# ==============================================================================
+
+app = FastAPI(title=settings.PROJECT_NAME, version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 @app.on_event("startup")
 def on_startup():
     init_db()
 
-# Include API Routers
-app.include_router(auth.router)
-app.include_router(profile.router)
-app.include_router(roles.router)
-app.include_router(analysis.router)
-app.include_router(roadmap.router)
-app.include_router(assessments.router)
-app.include_router(progress.router)
-app.include_router(mentor.router)
-app.include_router(agents_activity.router)
-app.include_router(admin.router)
-app.include_router(simulate.router)
-
-# Mount frontend dist static files if built
-frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../frontend/dist"))
-if os.path.exists(frontend_dist):
-    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
-
-    @app.get("/{full_path:path}")
-    def serve_spa(full_path: str):
-        file_path = os.path.join(frontend_dist, full_path)
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
-else:
-    @app.get("/")
-    def health_check():
-        return {
-            "status": "healthy",
-            "app": settings.PROJECT_NAME,
-            "tagline": "Know your gaps. Learn what matters. Get job-ready.",
-            "llm_provider": settings.LLM_PROVIDER
-        }
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Text, ForeignKey, DateTime, Boolean, JSON
-from sqlalchemy.orm import relationship
-from app.database import Base
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(150), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    role = Column(String(20), default="learner") # learner, admin
-    hours_per_week = Column(Integer, default=10)
-    learning_style = Column(String(50), default="project-first") # video-first, text-first, project-first
-    cohort_id = Column(String(50), default="cohort-2026-alpha")
-    current_role_id = Column(String(100), default="full-stack-developer")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    skills = relationship("UserSkill", back_populates="user", cascade="all, delete-orphan")
-    certifications = relationship("Certification", back_populates="user", cascade="all, delete-orphan")
-    projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
-    roadmaps = relationship("Roadmap", back_populates="user", cascade="all, delete-orphan")
-    attempts = relationship("Attempt", back_populates="user", cascade="all, delete-orphan")
-    agent_events = relationship("AgentEvent", back_populates="user", cascade="all, delete-orphan")
-    chat_messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
-
-class Skill(Base):
-    __tablename__ = "skills"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), unique=True, index=True, nullable=False)
-    category = Column(String(50), nullable=False) # Frontend, Backend, Database, DevOps, Data Science, etc.
-    description = Column(Text, nullable=True)
-    prerequisites = Column(JSON, default=list) # List of prerequisite skill names (e.g., ["JavaScript"] for React)
-
-class UserSkill(Base):
-    __tablename__ = "user_skills"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    skill_name = Column(String(100), index=True, nullable=False)
-    level = Column(Integer, default=50) # 0 to 100
-    evidence = Column(Text, nullable=True)
-    source = Column(String(50), default="self") # self, quiz, project, certificate
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="skills")
-
-class Certification(Base):
-    __tablename__ = "certifications"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(200), nullable=False)
-    issuer = Column(String(100), nullable=False)
-    issue_date = Column(String(50), nullable=True)
-    credential_url = Column(String(300), nullable=True)
-    skills_covered = Column(JSON, default=list)
-
-    user = relationship("User", back_populates="certifications")
-
-class Project(Base):
-    __tablename__ = "projects"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(200), nullable=False)
-    description = Column(Text, nullable=True)
-    repo_url = Column(String(300), nullable=True)
-    live_url = Column(String(300), nullable=True)
-    skills_used = Column(JSON, default=list)
-
-    user = relationship("User", back_populates="projects")
-
-class JobRole(Base):
-    __tablename__ = "job_roles"
-
-    id = Column(String(100), primary_key=True) # e.g. "full-stack-developer"
-    name = Column(String(150), nullable=False)
-    category = Column(String(100), nullable=False)
-    description = Column(Text, nullable=True)
-    # List of {"skill": "JavaScript", "weight": 5, "required_level": 80}
-    required_skills = Column(JSON, nullable=False, default=list)
-
-class Roadmap(Base):
-    __tablename__ = "roadmaps"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    target_role_id = Column(String(100), nullable=False)
-    role_name = Column(String(150), nullable=False)
-    total_weeks = Column(Integer, default=12)
-    readiness_score = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="roadmaps")
-    items = relationship("RoadmapItem", back_populates="roadmap", cascade="all, delete-orphan", order_by="RoadmapItem.order")
-
-class RoadmapItem(Base):
-    __tablename__ = "roadmap_items"
-
-    id = Column(Integer, primary_key=True, index=True)
-    roadmap_id = Column(Integer, ForeignKey("roadmaps.id"), nullable=False)
-    skill_name = Column(String(100), nullable=False)
-    order = Column(Integer, default=1)
-    week = Column(Integer, default=1)
-    status = Column(String(20), default="locked") # locked, in_progress, completed
-    reason = Column(String(255), nullable=True) # e.g. "Core requirement", "Inserted remedial topic: Low quiz score (45%)"
-    practice_task = Column(JSON, nullable=True) # {title, description, test_criteria, starter_code}
-    resources = Column(JSON, default=list) # [{title, type, url, difficulty, duration}]
-    completed_at = Column(DateTime, nullable=True)
-
-    roadmap = relationship("Roadmap", back_populates="items")
-
-class Resource(Base):
-    __tablename__ = "resources"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(200), nullable=False)
-    type = Column(String(50), nullable=False) # course, tutorial, video, docs, exercise
-    url = Column(String(300), nullable=False)
-    skill_name = Column(String(100), index=True, nullable=False)
-    difficulty = Column(String(50), default="beginner") # beginner, intermediate, advanced
-    duration = Column(String(50), default="2 hours")
-
-class Assessment(Base):
-    __tablename__ = "assessments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    skill_name = Column(String(100), index=True, nullable=False)
-    difficulty = Column(String(50), default="intermediate")
-    title = Column(String(200), nullable=False)
-    # List of {id: int, question: str, options: [str], correct_answer: int, explanation: str, subtopic: str}
-    questions = Column(JSON, nullable=False, default=list)
-
-class Attempt(Base):
-    __tablename__ = "attempts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    assessment_id = Column(Integer, ForeignKey("assessments.id"), nullable=True)
-    skill_name = Column(String(100), nullable=False)
-    score = Column(Float, nullable=False) # 0 to 100
-    weak_subtopics = Column(JSON, default=list)
-    feedback = Column(Text, nullable=True)
-    answers = Column(JSON, default=dict)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="attempts")
-
-class AgentEvent(Base):
-    __tablename__ = "agent_events"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    event_type = Column(String(100), nullable=False) # profile_created, goal_changed, assessment_submitted, etc.
-    agent_name = Column(String(100), nullable=False) # ProfileAgent, CareerAgent, GapAnalyst, CurriculumAgent, etc.
-    input_summary = Column(Text, nullable=True)
-    output_summary = Column(Text, nullable=True)
-
-    user = relationship("User", back_populates="agent_events")
-
-class ChatMessage(Base):
-    __tablename__ = "chat_messages"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    role = Column(String(20), nullable=False) # user, assistant, system
-    agent_name = Column(String(50), default="MentorAgent")
-    message = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="chat_messages")
-
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Text, ForeignKey, DateTime, Boolean, JSON
-from sqlalchemy.orm import relationship
-from app.database import Base
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(150), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    role = Column(String(20), default="learner") # learner, admin
-    hours_per_week = Column(Integer, default=10)
-    learning_style = Column(String(50), default="project-first") # video-first, text-first, project-first
-    cohort_id = Column(String(50), default="cohort-2026-alpha")
-    current_role_id = Column(String(100), default="full-stack-developer")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    skills = relationship("UserSkill", back_populates="user", cascade="all, delete-orphan")
-    certifications = relationship("Certification", back_populates="user", cascade="all, delete-orphan")
-    projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
-    roadmaps = relationship("Roadmap", back_populates="user", cascade="all, delete-orphan")
-    attempts = relationship("Attempt", back_populates="user", cascade="all, delete-orphan")
-    agent_events = relationship("AgentEvent", back_populates="user", cascade="all, delete-orphan")
-    chat_messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
-
-class Skill(Base):
-    __tablename__ = "skills"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), unique=True, index=True, nullable=False)
-    category = Column(String(50), nullable=False) # Frontend, Backend, Database, DevOps, Data Science, etc.
-    description = Column(Text, nullable=True)
-    prerequisites = Column(JSON, default=list) # List of prerequisite skill names (e.g., ["JavaScript"] for React)
-
-class UserSkill(Base):
-    __tablename__ = "user_skills"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    skill_name = Column(String(100), index=True, nullable=False)
-    level = Column(Integer, default=50) # 0 to 100
-    evidence = Column(Text, nullable=True)
-    source = Column(String(50), default="self") # self, quiz, project, certificate
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="skills")
-
-class Certification(Base):
-    __tablename__ = "certifications"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(200), nullable=False)
-    issuer = Column(String(100), nullable=False)
-    issue_date = Column(String(50), nullable=True)
-    credential_url = Column(String(300), nullable=True)
-    skills_covered = Column(JSON, default=list)
-
-    user = relationship("User", back_populates="certifications")
-
-class Project(Base):
-    __tablename__ = "projects"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(200), nullable=False)
-    description = Column(Text, nullable=True)
-    repo_url = Column(String(300), nullable=True)
-    live_url = Column(String(300), nullable=True)
-    skills_used = Column(JSON, default=list)
-
-    user = relationship("User", back_populates="projects")
-
-class JobRole(Base):
-    __tablename__ = "job_roles"
-
-    id = Column(String(100), primary_key=True) # e.g. "full-stack-developer"
-    name = Column(String(150), nullable=False)
-    category = Column(String(100), nullable=False)
-    description = Column(Text, nullable=True)
-    # List of {"skill": "JavaScript", "weight": 5, "required_level": 80}
-    required_skills = Column(JSON, nullable=False, default=list)
-
-class Roadmap(Base):
-    __tablename__ = "roadmaps"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    target_role_id = Column(String(100), nullable=False)
-    role_name = Column(String(150), nullable=False)
-    total_weeks = Column(Integer, default=12)
-    readiness_score = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="roadmaps")
-    items = relationship("RoadmapItem", back_populates="roadmap", cascade="all, delete-orphan", order_by="RoadmapItem.order")
-
-class RoadmapItem(Base):
-    __tablename__ = "roadmap_items"
-
-    id = Column(Integer, primary_key=True, index=True)
-    roadmap_id = Column(Integer, ForeignKey("roadmaps.id"), nullable=False)
-    skill_name = Column(String(100), nullable=False)
-    order = Column(Integer, default=1)
-    week = Column(Integer, default=1)
-    status = Column(String(20), default="locked") # locked, in_progress, completed
-    reason = Column(String(255), nullable=True) # e.g. "Core requirement", "Inserted remedial topic: Low quiz score (45%)"
-    practice_task = Column(JSON, nullable=True) # {title, description, test_criteria, starter_code}
-    resources = Column(JSON, default=list) # [{title, type, url, difficulty, duration}]
-    completed_at = Column(DateTime, nullable=True)
-
-    roadmap = relationship("Roadmap", back_populates="items")
-
-class Resource(Base):
-    __tablename__ = "resources"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(200), nullable=False)
-    type = Column(String(50), nullable=False) # course, tutorial, video, docs, exercise
-    url = Column(String(300), nullable=False)
-    skill_name = Column(String(100), index=True, nullable=False)
-    difficulty = Column(String(50), default="beginner") # beginner, intermediate, advanced
-    duration = Column(String(50), default="2 hours")
-
-class Assessment(Base):
-    __tablename__ = "assessments"
-
-    id = Column(Integer, primary_key=True, index=True)
-    skill_name = Column(String(100), index=True, nullable=False)
-    difficulty = Column(String(50), default="intermediate")
-    title = Column(String(200), nullable=False)
-    # List of {id: int, question: str, options: [str], correct_answer: int, explanation: str, subtopic: str}
-    questions = Column(JSON, nullable=False, default=list)
-
-class Attempt(Base):
-    __tablename__ = "attempts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    assessment_id = Column(Integer, ForeignKey("assessments.id"), nullable=True)
-    skill_name = Column(String(100), nullable=False)
-    score = Column(Float, nullable=False) # 0 to 100
-    weak_subtopics = Column(JSON, default=list)
-    feedback = Column(Text, nullable=True)
-    answers = Column(JSON, default=dict)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="attempts")
-
-class AgentEvent(Base):
-    __tablename__ = "agent_events"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    event_type = Column(String(100), nullable=False) # profile_created, goal_changed, assessment_submitted, etc.
-    agent_name = Column(String(100), nullable=False) # ProfileAgent, CareerAgent, GapAnalyst, CurriculumAgent, etc.
-    input_summary = Column(Text, nullable=True)
-    output_summary = Column(Text, nullable=True)
-
-    user = relationship("User", back_populates="agent_events")
-
-class ChatMessage(Base):
-    __tablename__ = "chat_messages"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    role = Column(String(20), nullable=False) # user, assistant, system
-    agent_name = Column(String(50), default="MentorAgent")
-    message = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-
-    user = relationship("User", back_populates="chat_messages")
-
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Text, ForeignKey, DateTime, Boolean, JSON
-from sqlalchemy.orm import relationship
-from app.database import Base
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(150), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    role = Column(String(20), default="learner") # learner, admin
-    hours_per_week = Column(Integer, default=10)
-    learning_style = Column(String(50), default="project-first") # video-first, text-first, project-first
-    cohort_id = Column(String(50), default="cohort-2026-alpha")
-    current_role_id = Column(String(100), default="full-stack-developer")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    skills = relationship("UserSkill", back_populates="user", cascade="all, delete-orphan")
-    certifications = relationship("Certification", back_populates="user", cascade="all, delete-orphan")
-    projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
-    roadmaps = relationship("Roadmap", back_populates="user", cascade="all, delete-orphan")
-    attempts = relationship("Attempt", back_populates="user", cascade="all, delete-orphan")
-    agent_events = relationship("AgentEvent", back_populates="user", cascade="all, delete-orphan")
-    chat_messages = relationship("ChatMessage", back_populates="user", cascade="all, delete-orphan")
-
-class Skill(Base):
-    __tablename__ = "skills"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), unique=True, index=True, nullable=False)
-    category = Column(String(50), nullable=False) # Frontend, Backend, Database, DevOps, Data Science, etc.
-    description = Column(Text, nullable=True)
-    prerequisites = Column(JSON, default=list) # List of prerequisite skill names (e.g., ["JavaScript"] for React)
-
-class UserSkill(Base):
-    __tablename__ = "user_skills"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    skill_name = Column(String(100), index=True, nullable=False)
-    level = Column(Integer, default=50) # 0 to 100
-    evidence = Column(Text, nullable=True)
-    source = Column(String(50), default="self") # self, quiz, project, certificate
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    user = relationship("User", back_populates="skills")
-
-class Certification(Base):
-    __tablename__ = "certifications"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(200), nullable=False)
-    issuer = Column(String(100), nullable=False)
-    issue_date = Column(String(50), nullable=True)
-    credential_url = Column(String(300), nullable=True)
-    skills_covered = Column(JSON, default=list)
-
-    user = relationship("User", back_populates="certifications")
-
-class Project(Base):
-    __tablename__ = "projects"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    title = Column(String(200), nullable=False)
-    description = Column(Text, nullable=True)
-    repo_url = Column(String(300), nullable=True)
-    live_url = Column(String(300), nullable=True)
-    skills_used = Column(JSON, default=list)
-
-    user = relationship("User", back_populates="projects")
-
+@app.post("/auth/register", response_model=Token)
+def register(user_in: UserRegister, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.email == user_in.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered.")
+    new_user = User(name=user_in.name, email=user_in.email, hashed_password=hash_password(user_in.password), role=user_in.role or "learner", hours_per_week=user_in.hours_per_week or 10, target_role_id=user_in.target_role_id or "full-stack-developer")
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    orchestrator.handle_event("profile_created", db, new_user)
+    return {"access_token": create_access_token({"sub": new_user.email, "user_id": new_user.id, "role": new_user.role}), "token_type": "bearer", "user_id": new_user.id, "name": new_user.name, "email": new_user.email, "role": new_user.role}
+
+@app.post("/auth/login", response_model=Token)
+def login(login_data: UserLogin, db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.email == login_data.email).first()
+    if not u or not verify_password(login_data.password, u.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect credentials")
+    return {"access_token": create_access_token({"sub": u.email, "user_id": u.id, "role": u.role}), "token_type": "bearer", "user_id": u.id, "name": u.name, "email": u.email, "role": u.role}
+
+@app.get("/auth/me", response_model=UserResponse)
+def get_me(user: User = Depends(get_current_user)):
+    return user
+
+@app.get("/analysis", response_model=SkillAnalysisResponse)
+def get_analysis(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return gap_analyst_agent.analyze_gaps(db, user, user.current_role_id)
+
+@app.get("/roles", response_model=List[JobRoleResponse])
+def get_roles(db: Session = Depends(get_db)):
+    return db.query(JobRole).all()
+
+@app.post("/goal")
+def set_goal(payload: Dict[str, str], user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    role_id = payload.get("role_id", "full-stack-developer")
+    res = orchestrator.handle_event("goal_changed", db, user, {"new_role_id": role_id})
+    return {"message": f"Switched to {role_id}", "actions_taken": res.get("actions_taken", [])}
+
+@app.get("/roadmap", response_model=RoadmapResponse)
+def get_roadmap(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    rm = db.query(Roadmap).filter(Roadmap.user_id == user.id).first()
+    items = db.query(RoadmapItem).filter(RoadmapItem.roadmap_id == rm.id).order_by(RoadmapItem.order.asc()).all() if rm else []
+    return {"id": rm.id, "user_id": rm.user_id, "target_role_id": rm.target_role_id, "role_name": rm.role_name, "total_weeks": rm.total_weeks, "readiness_score": rm.readiness_score, "items": items}
+
+@app.post("/assessments/{skill_name}/submit", response_model=QuizResultResponse)
+def submit_quiz(skill_name: str, payload: QuizSubmitRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    res = orchestrator.handle_event("assessment_submitted", db, user, {"skill_name": skill_name, "answers": payload.answers})
+    grade = res.get("grade", {})
+    return {"skill_name": skill_name, "score": grade.get("score", 0.0), "passed": grade.get("passed", False), "weak_subtopics": grade.get("weak_subtopics", []), "feedback": grade.get("feedback", ""), "roadmap_updated": res.get("roadmap_updated", False), "explanation": res.get("explanation", "")}
+
+@app.post("/mentor/chat", response_model=ChatResponse)
+def mentor_chat(req: ChatRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    reply = mentor_agent.chat(db, user, req.message)
+    return {"reply": reply, "agent_name": "MentorAgent", "timestamp": datetime.utcnow()}
+
+@app.get("/agents/activity", response_model=List[AgentEventResponse])
+def get_activity(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.query(AgentEvent).order_by(AgentEvent.timestamp.desc()).limit(50).all()
+
+@app.post("/simulate", response_model=SimulationResponse)
+def simulate_career(req: SimulationRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    role = db.query(JobRole).filter(JobRole.id == (req.role_id or user.current_role_id)).first() or db.query(JobRole).first()
+    user_skills = {s.skill_name.lower(): s.level for s in db.query(UserSkill).filter(UserSkill.user_id == user.id).all()}
+    reqs = role.required_skills or []
+    tot_w = sum([r.get("weight", 3) for r in reqs])
+    curr_w = sum([r.get("weight", 3) * min(user_skills.get(r["skill"].lower(), 0) / r.get("required_level", 80), 1.0) for r in reqs])
+    curr_r = round(curr_w / tot_w * 100.0, 1) if tot_w > 0 else 0.0
+
+    sim_skills = dict(user_skills)
+    sim_skills[req.skill_to_add.lower()] = req.target_level
+    sim_w = sum([r.get("weight", 3) * min(sim_skills.get(r["skill"].lower(), 0) / r.get("required_level", 80), 1.0) for r in reqs])
+    proj_r = round(sim_w / tot_w * 100.0, 1) if tot_w > 0 else 0.0
+    return {"skill_added": req.skill_to_add, "target_level": req.target_level, "current_readiness": curr_r, "projected_readiness": proj_r, "delta": round(proj_r - curr_r, 1), "impact_description": f"Mastering {req.skill_to_add} elevates readiness by +{round(proj_r - curr_r, 1)}%!"}
+
+# ==============================================================================
+# SECTION 11: ENTRYPOINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    init_db()
+    print("SkillPath AI Initialized. Starting server on http://127.0.0.1:8000...")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
