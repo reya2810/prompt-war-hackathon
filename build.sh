@@ -16,3 +16,4 @@ echo "🌱 Initializing database and seed data..."
 python3 -c "import sys; sys.path.insert(0, './backend'); from app.seed.seed_data import init_db; init_db()"
 
 echo "✅ Build complete!"
+
