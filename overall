@@ -757,7 +757,9 @@ class CurriculumAgent(BaseAgent):
             task = {
                 "title": f"Milestone Challenge: {skill_name}",
                 "description": f"Build a functional micro-service verifying {skill_name} core syntax, edge cases, and asynchronous handling.",
-                "starter_code": f"// Implement {skill_name} challenge\\nfunction init() {{ console.log('{skill_name} ready'); }}\\ninit();"
+                "starter_code": f"// Implement {skill_name} challenge
+function init() { console.log('{skill_name} ready'); }
+init();"
             }
             item = RoadmapItem(roadmap_id=roadmap.id, skill_name=skill_name, order=idx+1, week=week_num, status="in_progress" if idx == 0 else "locked", reason=reason, practice_task=task, resources=res_list)
             db.add(item)
